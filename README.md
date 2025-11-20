@@ -20,7 +20,7 @@ int main(int argc, char *argv[]) {
     try {
         parser.parse(argc, argv, arg);
     } catch (const std::exception &e) {
-        std::cout << e.waht() << std::endl;
+        std::cout << e.what() << std::endl;
         std::cout << parser.help() << std::endl;
         return -1;
     }
