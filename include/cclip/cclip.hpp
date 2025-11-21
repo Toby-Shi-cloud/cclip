@@ -22,12 +22,6 @@
 #include <vector>
 
 // copied from https://github.com/qlibs/reflect/blob/main/reflect
-namespace {
-struct REFLECT_STRUCT {
-  void *MEMBER;
-  enum class ENUM { VALUE };
-};
-}  // namespace
 namespace cclip::details::reflect {
 // clang-format off
 namespace {
@@ -41,6 +35,7 @@ template<class T> ref(T&) -> ref<T>;
 
 #define REFLECT_FWD(...) static_cast<decltype(__VA_ARGS__)&&>(__VA_ARGS__)
 #define REFLECT_FWD_LIKE(T, ...) static_cast<typename ::cclip::details::reflect::REFLECT_FWD_LIKE<::std::is_lvalue_reference_v<T>>::template type<decltype(__VA_ARGS__)>>(__VA_ARGS__)
+struct  REFLECT_STRUCT { void *MEMBER; enum class ENUM { VALUE }; };
 
 template<class Fn, class T> [[nodiscard]] constexpr decltype(auto) visit(Fn&& fn, T&&,   std::integral_constant<std::size_t, 0>) { return REFLECT_FWD(fn)(); }
 template<class Fn, class T> [[nodiscard]] constexpr decltype(auto) visit(Fn&& fn, T&& t, std::integral_constant<std::size_t, 1>) { auto&& [_1] = REFLECT_FWD(t); return REFLECT_FWD(fn)(REFLECT_FWD_LIKE(T, _1)); }
@@ -203,7 +198,7 @@ template <size_t I, typename T>
 using member_type = std::tuple_element_t<I, decltype(unpacked_as_tuple(std::declval<T>()))>;
 
 struct member_name_info {
-  static constexpr auto name = reflect::function_name<reflect::ref{reflect::ext<::REFLECT_STRUCT>.MEMBER}>();
+  static constexpr auto name = reflect::function_name<reflect::ref{reflect::ext<reflect::REFLECT_STRUCT>.MEMBER}>();
   static constexpr auto begin = name[name.find("MEMBER") - 1];
   static constexpr auto end = name.substr(name.find("MEMBER") + std::size(std::string_view{"MEMBER"}));
 };
@@ -219,7 +214,7 @@ inline constexpr auto member_name_stored = [] {
 
 template <size_t I, typename T>
 inline constexpr std::string_view member_name = member_name_stored<I, T>;
-static_assert(member_name<0, ::REFLECT_STRUCT> == "MEMBER");
+static_assert(member_name<0, reflect::REFLECT_STRUCT> == "MEMBER");
 
 template <class T>
 struct type_name_info {
@@ -231,7 +226,7 @@ struct type_name_info {
 template <class T>
   requires std::is_class_v<T>
 struct type_name_info<T> {
-  static constexpr auto name = reflect::function_name<::REFLECT_STRUCT>();
+  static constexpr auto name = reflect::function_name<reflect::REFLECT_STRUCT>();
   static constexpr auto begin = name.find("REFLECT_STRUCT");
   static constexpr auto end = name.substr(begin + std::size(std::string_view{"REFLECT_STRUCT"}));
 };
@@ -239,7 +234,7 @@ struct type_name_info<T> {
 template <class T>
   requires std::is_enum_v<T>
 struct type_name_info<T> {
-  static constexpr auto name = reflect::function_name<::REFLECT_STRUCT::ENUM>();
+  static constexpr auto name = reflect::function_name<reflect::REFLECT_STRUCT::ENUM>();
   static constexpr auto begin = name.find("REFLECT_STRUCT::ENUM");
   static constexpr auto end = name.substr(begin + std::size(std::string_view{"REFLECT_STRUCT::ENUM"}));
 };
@@ -254,7 +249,7 @@ inline constexpr auto type_name_stored = [] {
 
 template <typename T>
 inline constexpr std::string_view type_name = type_name_stored<T>;
-static_assert(type_name<::REFLECT_STRUCT> == "REFLECT_STRUCT");
+static_assert(type_name<reflect::REFLECT_STRUCT> == "REFLECT_STRUCT");
 
 template <typename T, typename Fn>
 constexpr void for_each(T &&t, Fn &&fn) {
