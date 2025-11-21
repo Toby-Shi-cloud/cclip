@@ -6,6 +6,7 @@
 #include <charconv>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <numeric>
 #include <ranges>
@@ -21,6 +22,12 @@
 #include <vector>
 
 // copied from https://github.com/qlibs/reflect/blob/main/reflect
+namespace {
+struct REFLECT_STRUCT {
+  void *MEMBER;
+  enum class ENUM { VALUE };
+};
+}  // namespace
 namespace cclip::details::reflect {
 // clang-format off
 namespace {
@@ -34,7 +41,6 @@ template<class T> ref(T&) -> ref<T>;
 
 #define REFLECT_FWD(...) static_cast<decltype(__VA_ARGS__)&&>(__VA_ARGS__)
 #define REFLECT_FWD_LIKE(T, ...) static_cast<typename ::cclip::details::reflect::REFLECT_FWD_LIKE<::std::is_lvalue_reference_v<T>>::template type<decltype(__VA_ARGS__)>>(__VA_ARGS__)
-struct  REFLECT_STRUCT { void* MEMBER; enum class ENUM { VALUE }; };
 
 template<class Fn, class T> [[nodiscard]] constexpr decltype(auto) visit(Fn&& fn, T&&,   std::integral_constant<std::size_t, 0>) { return REFLECT_FWD(fn)(); }
 template<class Fn, class T> [[nodiscard]] constexpr decltype(auto) visit(Fn&& fn, T&& t, std::integral_constant<std::size_t, 1>) { auto&& [_1] = REFLECT_FWD(t); return REFLECT_FWD(fn)(REFLECT_FWD_LIKE(T, _1)); }
@@ -197,7 +203,7 @@ template <size_t I, typename T>
 using member_type = std::tuple_element_t<I, decltype(unpacked_as_tuple(std::declval<T>()))>;
 
 struct member_name_info {
-  static constexpr auto name = reflect::function_name<reflect::ref{reflect::ext<reflect::REFLECT_STRUCT>.MEMBER}>();
+  static constexpr auto name = reflect::function_name<reflect::ref{reflect::ext<::REFLECT_STRUCT>.MEMBER}>();
   static constexpr auto begin = name[name.find("MEMBER") - 1];
   static constexpr auto end = name.substr(name.find("MEMBER") + std::size(std::string_view{"MEMBER"}));
 };
@@ -206,14 +212,14 @@ template <size_t I, typename T>
 inline constexpr auto member_name_stored = [] {
   constexpr auto function_name =
       reflect::function_name<reflect::ref{visit(nth_pack_element<I>, reflect::ext<std::remove_cvref_t<T>>)}>();
-  constexpr auto begin = function_name.find(member_name_info::begin);
-  constexpr auto suffix = function_name.substr(begin + 1);
-  constexpr auto name = suffix.substr(0, suffix.size() - member_name_info::end.size());
+  constexpr auto tmp_name = function_name.substr(0, function_name.find(member_name_info::end));
+  constexpr auto name = tmp_name.substr(tmp_name.find_last_of(member_name_info::begin) + 1);
   return fixed_string<name.size()>(name);
 }();
 
 template <size_t I, typename T>
 inline constexpr std::string_view member_name = member_name_stored<I, T>;
+static_assert(member_name<0, ::REFLECT_STRUCT> == "MEMBER");
 
 template <class T>
 struct type_name_info {
@@ -225,7 +231,7 @@ struct type_name_info {
 template <class T>
   requires std::is_class_v<T>
 struct type_name_info<T> {
-  static constexpr auto name = reflect::function_name<reflect::REFLECT_STRUCT>();
+  static constexpr auto name = reflect::function_name<::REFLECT_STRUCT>();
   static constexpr auto begin = name.find("REFLECT_STRUCT");
   static constexpr auto end = name.substr(begin + std::size(std::string_view{"REFLECT_STRUCT"}));
 };
@@ -233,7 +239,7 @@ struct type_name_info<T> {
 template <class T>
   requires std::is_enum_v<T>
 struct type_name_info<T> {
-  static constexpr auto name = reflect::function_name<reflect::REFLECT_STRUCT::ENUM>();
+  static constexpr auto name = reflect::function_name<::REFLECT_STRUCT::ENUM>();
   static constexpr auto begin = name.find("REFLECT_STRUCT::ENUM");
   static constexpr auto end = name.substr(begin + std::size(std::string_view{"REFLECT_STRUCT::ENUM"}));
 };
@@ -248,6 +254,7 @@ inline constexpr auto type_name_stored = [] {
 
 template <typename T>
 inline constexpr std::string_view type_name = type_name_stored<T>;
+static_assert(type_name<::REFLECT_STRUCT> == "REFLECT_STRUCT");
 
 template <typename T, typename Fn>
 constexpr void for_each(T &&t, Fn &&fn) {
@@ -467,18 +474,18 @@ class Parser {
             } else {
               for (std::string_view fmt : InnerType::get_long_fmt()) {
                 auto succ = parser.long_arg_map_.try_emplace(std::string(fmt), cur_idx).second;
-                if (!succ) throw build_exception(std::format("conflict long option: {}", fmt));
+                if (!succ) throw build_exception(std::format("conflict long option: {} at {}", fmt, arg_name));
               }
             }
           }
           if constexpr (InnerType::has_short_fmt) {
             if constexpr (InnerType::shortf_builder_size == 0) {
               auto succ = parser.short_arg_map_.try_emplace(arg_name[0], cur_idx).second;
-              if (!succ) throw build_exception(std::format("conflict short option: {}", arg_name[0]));
+              if (!succ) throw build_exception(std::format("conflict short option: {} at {}", arg_name[0], arg_name));
             } else {
               for (char fmt : InnerType::get_short_fmt()) {
                 auto succ = parser.short_arg_map_.try_emplace(fmt, cur_idx).second;
-                if (!succ) throw build_exception(std::format("conflict short option: {}", fmt));
+                if (!succ) throw build_exception(std::format("conflict short option: {} at {}", fmt, arg_name));
               }
             }
           }
@@ -833,7 +840,7 @@ help(const char (&)[N]) -> help<N - 1>;
 template <size_t N>
 struct longf {
   details::fixed_string<N> data;
-  consteval longf(const details::fixed_string<N> &msg) : data(msg) {}
+  consteval longf(const details::fixed_string<N> &s) : data(s) {}
 };
 template <size_t N>
 longf(const char (&)[N]) -> longf<N - 1>;
@@ -875,20 +882,40 @@ class Option {
                 "Option flag should contain one of LONG, SHORT and POSITIONAL");
 
   static constexpr size_t at_least_builder_size =
-      (static_cast<size_t>(std::same_as<decltype(args), option_builder::at_least>) + ... + 0);
+      (static_cast<size_t>(std::same_as<std::remove_cvref_t<decltype(args)>, option_builder::at_least>) + ... + 0);
   static constexpr size_t at_most_builder_size =
-      (static_cast<size_t>(std::same_as<decltype(args), option_builder::at_most>) + ... + 0);
+      (static_cast<size_t>(std::same_as<std::remove_cvref_t<decltype(args)>, option_builder::at_most>) + ... + 0);
   static constexpr size_t shortf_builder_size =
-      (static_cast<size_t>(std::same_as<decltype(args), option_builder::shortf>) + ... + 0);
+      (static_cast<size_t>(std::same_as<std::remove_cvref_t<decltype(args)>, option_builder::shortf>) + ... + 0);
   static constexpr size_t longf_builder_size =
-      (static_cast<size_t>(details::is_option_builder_longf<decltype(args)>::value) + ... + 0);
+      (static_cast<size_t>(details::is_option_builder_longf<std::remove_cvref_t<decltype(args)>>::value) + ... + 0);
   static constexpr size_t help_builder_size =
-      (static_cast<size_t>(details::is_option_builder_help<decltype(args)>::value) + ... + 0);
+      (static_cast<size_t>(details::is_option_builder_help<std::remove_cvref_t<decltype(args)>>::value) + ... + 0);
 
   static_assert(at_least_builder_size <= 1, "Option should not have at_least builder more than 1");
   static_assert(at_most_builder_size <= 1, "Option should not have at_most builder more than 1");
   static_assert(help_builder_size <= 1, "Option should not have help builder more than 1");
 
+  template <size_t I>
+  static consteval size_t get_at_least() {
+    if constexpr (I == sizeof...(args))
+      return 0;
+    else if constexpr (std::same_as<std::remove_cvref_t<decltype(details::nth_pack_element<I>(args...))>,
+                                    option_builder::at_least>)
+      return details::nth_pack_element<I>(args...).data;
+    else
+      return get_at_least<I + 1>();
+  }
+  template <size_t I>
+  static consteval size_t get_at_most() {
+    if constexpr (I == sizeof...(args))
+      return 0;
+    else if constexpr (std::same_as<std::remove_cvref_t<decltype(details::nth_pack_element<I>(args...))>,
+                                    option_builder::at_most>)
+      return details::nth_pack_element<I>(args...).data;
+    else
+      return get_at_most<I + 1>();
+  }
   template <size_t I>
   static consteval auto get_help_string() {
     if constexpr (I == sizeof...(args))
@@ -927,14 +954,13 @@ class Option {
     std::vector<std::string_view> result;
     result.reserve(longf_builder_size);
     [&]<size_t... Is>(std::index_sequence<Is...>) {
-      ((get_long_fmt_impl<Is>() ? result.push_back(get_long_fmt_impl<Is>()) : (void)0), ...);
+      ((!get_long_fmt_impl<Is>().empty() ? result.push_back(get_long_fmt_impl<Is>()) : (void)0), ...);
     }(std::make_index_sequence<sizeof...(args)>());
     return result;
   }
 
-  static constexpr size_t at_least =
-      ((std::same_as<decltype(args), option_builder::at_least> ? args.data : 0) | ... | 0);
-  static constexpr size_t at_most = ((std::same_as<decltype(args), option_builder::at_most> ? args.data : 0) | ... | 0);
+  static constexpr size_t at_least = get_at_least<0>();
+  static constexpr size_t at_most = get_at_most<0>();
   static constexpr auto help_string = get_help_string<0>();
 
  public:
@@ -960,12 +986,12 @@ struct is_wrapped_option<Option<T, flags, args...>> : std::true_type {};
 template <std::default_initializable T, OptionType flags, details::is_option_builder auto... args>
   requires(parse_info<T>::action != nullptr)
 struct parse_info<Option<T, flags, args...>> {
-  using Option = Option<T, flags, args...>;
-  static constexpr parse_action_t<Option> action = [](std::string_view sv, Option &value) {
+  using MyOption = Option<T, flags, args...>;
+  static constexpr parse_action_t<MyOption> action = [](std::string_view sv, MyOption &value) {
     return parse_info<T>::action(sv, static_cast<T &>(value));
   };
-  static constexpr size_t at_least = Option::at_least ? Option::at_least : parse_info<T>::at_least;
-  static constexpr size_t at_most = Option::at_most ? Option::at_most : parse_info<T>::at_most;
+  static constexpr size_t at_least = MyOption::at_least ? MyOption::at_least : parse_info<T>::at_least;
+  static constexpr size_t at_most = MyOption::at_most ? MyOption::at_most : parse_info<T>::at_most;
   static constexpr bool has_value = parse_info<T>::has_value;
 };
 }  // namespace details
