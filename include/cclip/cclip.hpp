@@ -746,7 +746,7 @@ class Parser {
         ss << "  " << arg_names_[idx];
         size_t spaces = longest_name - arg_names_[idx].size();
         while (spaces--) ss << ' ';
-        ss << "  " << help_messages_[idx];
+        ss << "  " << (help_messages_[idx].empty() ? arg_names_[idx] : help_messages_[idx]);
         if (at_least_repeat_times_[idx] == 0 && at_most_repeat_times_[idx] == 1)
           ;
         else if (at_least_repeat_times_[idx] == 1 && at_most_repeat_times_[idx] == 1)
@@ -778,7 +778,7 @@ class Parser {
         for (auto &&str : arg_opts[idx].second | std::views::drop(1)) ss << ", " << str, bytes += 2 + str.size();
         size_t spaces = longest_opt - bytes;
         while (spaces--) ss << ' ';
-        ss << "  " << help_messages_[idx];
+        ss << "  " << (help_messages_[idx].empty() ? arg_names_[idx] : help_messages_[idx]);
         if (at_least_repeat_times_[idx] == 0 && at_most_repeat_times_[idx] == 1)
           ;
         else if (at_least_repeat_times_[idx] == 1 && at_most_repeat_times_[idx] == 1)
