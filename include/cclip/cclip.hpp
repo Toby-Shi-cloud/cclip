@@ -1,13 +1,16 @@
 #ifndef CCLIP_CCLIP_H_
 #define CCLIP_CCLIP_H_
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <concepts>
 #include <cstddef>
 #include <format>
+#include <numeric>
 #include <ranges>
 #include <source_location>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -111,6 +114,7 @@ namespace cclip {
 namespace details {
 template <size_t N>
 struct fixed_string {
+  consteval fixed_string() noexcept {}
   consteval fixed_string(const char (&str)[N + 1]) noexcept {
     for (size_t i = 0; i <= N; ++i) data[i] = str[i];
   }
@@ -123,7 +127,6 @@ struct fixed_string {
   constexpr size_t size() const noexcept { return N; }
   constexpr auto operator<=>(const fixed_string &) const noexcept = default;
 
- private:
   char data[N + 1];
 };
 template <size_t N>
@@ -297,6 +300,7 @@ struct parse_info {
   static constexpr parse_action_t<T> action = nullptr;
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = 0;
+  static constexpr bool has_value = false;
 };
 
 template <std::integral T>
@@ -314,6 +318,7 @@ struct parse_info<T> {
   };
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = 1;
+  static constexpr bool has_value = !std::same_as<T, bool>;
 };
 
 template <std::floating_point T>
@@ -346,6 +351,7 @@ struct parse_info<T> {
   };
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = 1;
+  static constexpr bool has_value = true;
 };
 
 template <typename Ac>
@@ -358,6 +364,7 @@ struct parse_info<std::basic_string<char, std::char_traits<char>, Ac>> {
       };
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = 1;
+  static constexpr bool has_value = true;
 };
 
 template <>
@@ -369,6 +376,7 @@ struct parse_info<std::string_view> {
   };
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = 1;
+  static constexpr bool has_value = true;
 };
 
 template <std::ranges::range T>
@@ -384,6 +392,7 @@ struct parse_info<T> {
   };
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = static_cast<size_t>(-1);
+  static constexpr bool has_value = true;
 };
 
 template <std::ranges::range T>
@@ -399,7 +408,27 @@ struct parse_info<T> {
   };
   static constexpr size_t at_least = 0;
   static constexpr size_t at_most = static_cast<size_t>(-1);
+  static constexpr bool has_value = true;
 };
+
+template <std::ranges::range T>
+  requires requires(T &t, std::ranges::range_value_t<T> v) { t.push(std::move(v)); }
+// stack-like containers
+struct parse_info<T> {
+  static_assert(parse_info<std::ranges::range_value_t<T>>::action != nullptr, "The element of T cannot be parsed");
+  static constexpr parse_action_t<T> action = [](std::string_view sv, T &cont) {
+    std::ranges::range_value_t<T> value;
+    auto acc = parse_info<std::ranges::range_value_t<T>>::action(sv, value);
+    cont.push(std::move(value));
+    return acc;
+  };
+  static constexpr size_t at_least = 0;
+  static constexpr size_t at_most = static_cast<size_t>(-1);
+  static constexpr bool has_value = true;
+};
+
+template <typename T>
+struct is_wrapped_option : std::false_type {};
 }  // namespace details
 
 template <details::parsable... Ts>
@@ -422,16 +451,50 @@ class Parser {
     const auto build_impl = [&]<size_t OutI>(std::integral_constant<size_t, OutI>) {
       using T = std::tuple_element_t<OutI, std::tuple<Ts...>>;
       details::for_each<T>([&]<size_t InI>(std::integral_constant<size_t, InI>) {
+        using InnerType = details::member_type<InI, T>;
         size_t cur_idx = parser.action_table_.size();
         std::string arg_name = details::replace(details::member_name<InI, T>, '_', underline_replace);
         parser.arg_names_.push_back(arg_name);
-        auto succ = parser.long_arg_map_.try_emplace(std::move(arg_name), cur_idx).second;
-        if (!succ) throw build_exception(std::format("conflict name: {}", details::member_name<InI, T>));
-        using parse_info = details::parse_info<details::member_type<InI, T>>;
+        parser.help_messages_.emplace_back();
+        if constexpr (details::is_wrapped_option<InnerType>::value) {
+          if constexpr (InnerType::is_positional) {
+            parser.position_arg_map_.push_back(cur_idx);
+          }
+          if constexpr (InnerType::has_long_fmt) {
+            if constexpr (InnerType::longf_builder_size == 0) {
+              auto succ = parser.long_arg_map_.try_emplace(arg_name, cur_idx).second;
+              if (!succ) throw build_exception(std::format("conflict long name: {}", arg_name));
+            } else {
+              for (std::string_view fmt : InnerType::get_long_fmt()) {
+                auto succ = parser.long_arg_map_.try_emplace(std::string(fmt), cur_idx).second;
+                if (!succ) throw build_exception(std::format("conflict long option: {}", fmt));
+              }
+            }
+          }
+          if constexpr (InnerType::has_short_fmt) {
+            if constexpr (InnerType::shortf_builder_size == 0) {
+              auto succ = parser.short_arg_map_.try_emplace(arg_name[0], cur_idx).second;
+              if (!succ) throw build_exception(std::format("conflict short option: {}", arg_name[0]));
+            } else {
+              for (char fmt : InnerType::get_short_fmt()) {
+                auto succ = parser.short_arg_map_.try_emplace(fmt, cur_idx).second;
+                if (!succ) throw build_exception(std::format("conflict short option: {}", fmt));
+              }
+            }
+          }
+          if constexpr (InnerType::help_builder_size != 0) {
+            parser.help_messages_[cur_idx] = std::string(InnerType::help_string);
+          }
+        } else {
+          auto succ = parser.long_arg_map_.try_emplace(std::move(arg_name), cur_idx).second;
+          if (!succ) throw build_exception(std::format("conflict name: {}", details::member_name<InI, T>));
+        }
+        using parse_info = details::parse_info<InnerType>;
         parser.action_table_.push_back(&Parser::wrapped_action<parse_info::action, OutI, InI>);
         static_assert(parse_info::at_most > 0 && parse_info::at_most >= parse_info::at_least);
         parser.at_least_repeat_times_.push_back(parse_info::at_least);
         parser.at_most_repeat_times_.push_back(parse_info::at_most);
+        parser.has_value_.push_back(parse_info::has_value);
       });
     };
     [&]<size_t... Is>(std::index_sequence<Is...>) {
@@ -502,6 +565,26 @@ class Parser {
     return *this;
   }
 
+  Parser &set_help_msg(const std::string &opt, std::string msg) {
+    if (auto found = long_arg_map_.find(opt); found != long_arg_map_.end()) {
+      if (!help_messages_[found->second].empty())
+        throw build_exception(std::format("help message for {} already exists", opt));
+      help_messages_[found->second] = std::move(msg);
+    } else
+      throw build_exception(std::format("option \"{}\" not found", opt));
+    return *this;
+  }
+
+  Parser &set_help_msg(char opt, std::string msg) {
+    if (auto found = short_arg_map_.find(opt); found != short_arg_map_.end()) {
+      if (!help_messages_[found->second].empty())
+        throw build_exception(std::format("help message for {} already exists", opt));
+      help_messages_[found->second] = std::move(msg);
+    } else
+      throw build_exception(std::format("option \"{}\" not found", opt));
+    return *this;
+  }
+
   template <std::input_iterator Iter, std::sentinel_for<Iter> Sent>
     requires std::convertible_to<std::iter_reference_t<Iter>, std::string_view>
   void parse(Iter it, Sent se, Ts &...vs) const {
@@ -557,7 +640,7 @@ class Parser {
           }
         }
         if (active_arg == static_cast<size_t>(-1)) {
-          throw parse_exception(std::format("unknown option: {}", sv));
+          throw parse_exception(std::format("unknown option: {}", in_short_opt ? sv.substr(0, 1) : sv));
         }
       } else {
         // parse currently active argument
@@ -608,7 +691,103 @@ class Parser {
   }
   void parse(int argc, char *argv[], Ts &...vs) const { return parse(argv + 1, argv + argc, vs...); }
 
-  std::string help() const { return "help message not implement!"; }
+  std::string help(const std::string &program) const {
+    std::vector<std::pair<bool, std::vector<std::string>>> arg_opts(arg_names_.size());
+    for (auto &idx : position_arg_map_) arg_opts[idx].first = true;
+    for (auto &[s, idx] : long_arg_map_) arg_opts[idx].second.push_back(long_arg_prefix_ + s);
+    for (auto &[c, idx] : short_arg_map_) arg_opts[idx].second.push_back(short_arg_prefix_ + c);
+
+    std::stringstream ss;
+    ss << "Usage: " << program;
+    for (size_t idx = 0; idx < arg_names_.size(); ++idx) {
+      if (arg_opts[idx].second.empty()) continue;
+      ss << ' ';
+      bool required = at_least_repeat_times_[idx] > 0;
+      bool repeated = at_most_repeat_times_[idx] > 1;
+      std::string str = arg_opts[idx].second.front();
+      str += has_value_[idx] ? " VAR" : "";
+      if (required && repeated)
+        ss << "(" << str << "...)";
+      else if (required)
+        ss << str;
+      else if (repeated)
+        ss << "[" << str << "...]";
+      else
+        ss << "[" << str << "]";
+    }
+    for (auto &idx : position_arg_map_) {
+      ss << ' ';
+      bool required = at_least_repeat_times_[idx] > 0;
+      bool repeated = at_most_repeat_times_[idx] > 1;
+      const auto &str = arg_names_[idx];
+      if (required && repeated)
+        ss << "(" << str << "...)";
+      else if (required)
+        ss << str;
+      else if (repeated)
+        ss << "[" << str << "...]";
+      else
+        ss << "[" << str << "]";
+    }
+    ss << "\n\n";
+
+    if (!position_arg_map_.empty()) {
+      ss << "Positional arguments:\n";
+      size_t longest_name = std::ranges::max(position_arg_map_ |
+                                             std::views::transform([&](size_t idx) { return arg_names_[idx].size(); }));
+      for (auto &idx : position_arg_map_) {
+        ss << "  " << arg_names_[idx];
+        size_t spaces = longest_name - arg_names_[idx].size();
+        while (spaces--) ss << ' ';
+        ss << "  " << help_messages_[idx];
+        if (at_least_repeat_times_[idx] == 0 && at_most_repeat_times_[idx] == 1)
+          ;
+        else if (at_least_repeat_times_[idx] == 1 && at_most_repeat_times_[idx] == 1)
+          ss << " [required]";
+        else if (at_least_repeat_times_[idx] == at_most_repeat_times_[idx])
+          ss << " [nargs=" << at_least_repeat_times_[idx] << "]";
+        else if (at_most_repeat_times_[idx] == static_cast<size_t>(-1))
+          ss << " [nargs=" << at_least_repeat_times_[idx] << "..]";
+        else
+          ss << " [nargs=" << at_least_repeat_times_[idx] << ".." << at_most_repeat_times_[idx] << "]";
+        ss << '\n';
+      }
+    }
+
+    if (!position_arg_map_.empty() && (!short_arg_map_.empty() || !long_arg_map_.empty())) ss << '\n';
+    if (!short_arg_map_.empty() || !long_arg_map_.empty()) {
+      ss << "Optional arguments:\n";
+      size_t longest_opt =
+          std::ranges::max(arg_opts | std::views::transform([&](auto &&pair) -> size_t {
+                             if (pair.second.empty()) return 0;
+                             return std::accumulate(pair.second.begin(), pair.second.end(), size_t{0},
+                                                    [&](size_t acc, auto &&str) { return acc + str.size(); }) +
+                                    (pair.second.size() - 1) * 2;
+                           }));
+      for (size_t idx = 0; idx < arg_names_.size(); ++idx) {
+        if (arg_opts[idx].second.empty()) continue;
+        size_t bytes = arg_opts[idx].second.front().size();
+        ss << "  " << arg_opts[idx].second.front();
+        for (auto &&str : arg_opts[idx].second | std::views::drop(1)) ss << ", " << str, bytes += 2 + str.size();
+        size_t spaces = longest_opt - bytes;
+        while (spaces--) ss << ' ';
+        ss << "  " << help_messages_[idx];
+        if (at_least_repeat_times_[idx] == 0 && at_most_repeat_times_[idx] == 1)
+          ;
+        else if (at_least_repeat_times_[idx] == 1 && at_most_repeat_times_[idx] == 1)
+          ss << " [required]";
+        else if (at_least_repeat_times_[idx] == at_most_repeat_times_[idx])
+          ss << " [nargs=" << at_least_repeat_times_[idx] << "]";
+        else if (at_most_repeat_times_[idx] == static_cast<size_t>(-1))
+          ss << " [nargs=" << at_least_repeat_times_[idx] << "..]";
+        else
+          ss << " [nargs=" << at_least_repeat_times_[idx] << ".." << at_most_repeat_times_[idx] << "]";
+        ss << '\n';
+      }
+    }
+
+    return std::move(ss).str();
+  }
 
  private:
   std::vector<size_t> position_arg_map_;
@@ -616,9 +795,180 @@ class Parser {
   std::unordered_map<std::string, size_t> long_arg_map_;
   std::vector<parse_action_t> action_table_;
   std::vector<std::string> arg_names_;
+  std::vector<std::string> help_messages_;
+  std::vector<bool> has_value_;
   std::vector<size_t> at_least_repeat_times_, at_most_repeat_times_;
   std::string long_arg_prefix_ = "--", short_arg_prefix_ = "-";
 };
+
+inline namespace option_builder {
+enum OptionType : uint8_t {
+  LONG = 0x1,
+  SHORT = 0x2,
+  POSITIONAL = 0x4,
+};
+inline consteval OptionType operator|(OptionType x, OptionType y) {
+  return static_cast<OptionType>(static_cast<uint8_t>(x) | static_cast<uint8_t>(y));
+}
+
+struct at_least {
+  size_t data;
+  consteval at_least(size_t t) : data(t) {}
+};
+inline constexpr at_least required{1};
+
+struct at_most {
+  size_t data;
+  consteval at_most(size_t t) : data(t) {}
+};
+
+template <size_t N>
+struct help {
+  details::fixed_string<N> data;
+  consteval help(const details::fixed_string<N> &msg) : data(msg) {}
+};
+template <size_t N>
+help(const char (&)[N]) -> help<N - 1>;
+
+template <size_t N>
+struct longf {
+  details::fixed_string<N> data;
+  consteval longf(const details::fixed_string<N> &msg) : data(msg) {}
+};
+template <size_t N>
+longf(const char (&)[N]) -> longf<N - 1>;
+
+struct shortf {
+  char data;
+  consteval shortf(char c) : data(c) {}
+};
+}  // namespace option_builder
+
+namespace details {
+template <typename T>
+struct is_option_builder_help : std::false_type {};
+template <size_t N>
+struct is_option_builder_help<option_builder::help<N>> : std::true_type {};
+
+template <typename T>
+struct is_option_builder_longf : std::false_type {};
+template <size_t N>
+struct is_option_builder_longf<option_builder::longf<N>> : std::true_type {};
+
+template <typename T>
+concept is_option_builder = std::same_as<T, at_least> || std::same_as<T, at_most> || std::same_as<T, shortf> ||
+                            is_option_builder_help<T>::value || is_option_builder_longf<T>::value;
+}  // namespace details
+
+inline namespace option_builder {
+template <std::default_initializable T, OptionType flags = LONG, details::is_option_builder auto... args>
+class Option {
+  template <details::parsable... Ts>
+  friend class ::cclip::Parser;
+  friend ::cclip::details::parse_info<Option>;
+
+  static constexpr bool is_positional = static_cast<bool>(flags & POSITIONAL);
+  static constexpr bool has_long_fmt = static_cast<bool>(flags & LONG);
+  static constexpr bool has_short_fmt = static_cast<bool>(flags & SHORT);
+
+  static_assert(is_positional || has_long_fmt || has_short_fmt,
+                "Option flag should contain one of LONG, SHORT and POSITIONAL");
+
+  static constexpr size_t at_least_builder_size =
+      (static_cast<size_t>(std::same_as<decltype(args), option_builder::at_least>) + ... + 0);
+  static constexpr size_t at_most_builder_size =
+      (static_cast<size_t>(std::same_as<decltype(args), option_builder::at_most>) + ... + 0);
+  static constexpr size_t shortf_builder_size =
+      (static_cast<size_t>(std::same_as<decltype(args), option_builder::shortf>) + ... + 0);
+  static constexpr size_t longf_builder_size =
+      (static_cast<size_t>(details::is_option_builder_longf<decltype(args)>::value) + ... + 0);
+  static constexpr size_t help_builder_size =
+      (static_cast<size_t>(details::is_option_builder_help<decltype(args)>::value) + ... + 0);
+
+  static_assert(at_least_builder_size <= 1, "Option should not have at_least builder more than 1");
+  static_assert(at_most_builder_size <= 1, "Option should not have at_most builder more than 1");
+  static_assert(help_builder_size <= 1, "Option should not have help builder more than 1");
+
+  template <size_t I>
+  static consteval auto get_help_string() {
+    if constexpr (I == sizeof...(args))
+      return details::fixed_string("");
+    else if constexpr (details::is_option_builder_help<
+                           std::remove_cvref_t<decltype(details::nth_pack_element<I>(args...))>>::value)
+      return details::nth_pack_element<I>(args...).data;
+    else
+      return get_help_string<I + 1>();
+  }
+  template <size_t I>
+  static consteval char get_short_fmt_impl() {
+    if constexpr (std::same_as<std::remove_cvref_t<decltype(details::nth_pack_element<I>(args...))>,
+                               option_builder::shortf>)
+      return details::nth_pack_element<I>(args...).data;
+    else
+      return 0;
+  }
+  template <size_t I>
+  static constexpr std::string_view get_long_fmt_impl() {
+    if constexpr (details::is_option_builder_longf<
+                      std::remove_cvref_t<decltype(details::nth_pack_element<I>(args...))>>::value)
+      return details::nth_pack_element<I>(args...).data;
+    else
+      return "";
+  }
+  static constexpr std::vector<char> get_short_fmt() {
+    std::vector<char> result;
+    result.reserve(shortf_builder_size);
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+      ((get_short_fmt_impl<Is>() ? result.push_back(get_short_fmt_impl<Is>()) : (void)0), ...);
+    }(std::make_index_sequence<sizeof...(args)>());
+    return result;
+  }
+  static constexpr std::vector<std::string_view> get_long_fmt() {
+    std::vector<std::string_view> result;
+    result.reserve(longf_builder_size);
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+      ((get_long_fmt_impl<Is>() ? result.push_back(get_long_fmt_impl<Is>()) : (void)0), ...);
+    }(std::make_index_sequence<sizeof...(args)>());
+    return result;
+  }
+
+  static constexpr size_t at_least =
+      ((std::same_as<decltype(args), option_builder::at_least> ? args.data : 0) | ... | 0);
+  static constexpr size_t at_most = ((std::same_as<decltype(args), option_builder::at_most> ? args.data : 0) | ... | 0);
+  static constexpr auto help_string = get_help_string<0>();
+
+ public:
+  constexpr Option() : data() {}
+  constexpr Option(T init) : data(std::move(init)) {}
+  constexpr Option &operator=(T init) { return data = std::move(init), *this; }
+  constexpr operator const T &() const & { return data; }
+  constexpr operator T &() & { return data; }
+  constexpr operator T() && { return std::move(data); }
+  constexpr const T &get() const & { return data; }
+  constexpr T &get() & { return data; }
+  constexpr T get() && { return std::move(data); }
+
+ private:
+  T data;
+};
+}  // namespace option_builder
+
+namespace details {
+template <std::default_initializable T, OptionType flags, details::is_option_builder auto... args>
+struct is_wrapped_option<Option<T, flags, args...>> : std::true_type {};
+
+template <std::default_initializable T, OptionType flags, details::is_option_builder auto... args>
+  requires(parse_info<T>::action != nullptr)
+struct parse_info<Option<T, flags, args...>> {
+  using Option = Option<T, flags, args...>;
+  static constexpr parse_action_t<Option> action = [](std::string_view sv, Option &value) {
+    return parse_info<T>::action(sv, static_cast<T &>(value));
+  };
+  static constexpr size_t at_least = Option::at_least ? Option::at_least : parse_info<T>::at_least;
+  static constexpr size_t at_most = Option::at_most ? Option::at_most : parse_info<T>::at_most;
+  static constexpr bool has_value = parse_info<T>::has_value;
+};
+}  // namespace details
 }  // namespace cclip
 
 #endif /* CCLIP_CCLIP_H_ */
